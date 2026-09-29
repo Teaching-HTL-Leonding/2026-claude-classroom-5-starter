@@ -53,7 +53,8 @@ tests/e2e                         Playwright against its own `next dev`
 docs/mcp.md                       registering both MCP servers with Claude Code
 .agents/skills/ (+ .claude/skills/ copy)   ai-tutor-design, ai-tutor-cli, add-app-to-server, copilotkit, mastra
 .tours/                           CodeTours the README points at
-.github/workflows/ci.yml          CI: lint, Vitest, build, Playwright without the LLM spec, on a generated .env
+.github/workflows/ci.yml          CI: lint, Vitest, build, Playwright without the LLM spec, on a generated .env;
+                                  on PRs also ai-review, a claude -p security review of the diff that fails on a high finding
 ```
 
 ## Commands
