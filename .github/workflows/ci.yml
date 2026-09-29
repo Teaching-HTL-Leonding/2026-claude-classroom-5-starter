@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      # Also builds the CLI through its `prepare` script.
+      - run: npm ci
+
+      # Nothing here calls a model: the LLM spec is skipped (no E2E_LLM), so
+      # the OpenRouter key is a placeholder and the auth secret is throwaway.
+      - name: Write .env
+        run: |
+          secret="$(openssl rand -base64 32)"
+          echo "::add-mask::$secret"
+          cat > .env <<EOF
+          DATABASE_URL=file:./data/app.db
+          OPENROUTER_API_KEY=sk-or-v1-ci-placeholder
+          BETTER_AUTH_SECRET=$secret
+          BETTER_AUTH_URL=http://localhost:3000
+          EOF
+
+      - run: npm run lint
+
+      - run: npm test
+
+      - run: npm run db:migrate
+
+      # `prebuild` also bundles the MCP App views the e2e server reads.
+      - run: npm run build
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # The config's reporter is `list` only; add `html` so a failure leaves a
+      # report to upload. The HTML reporter never tries to open itself on CI.
+      - name: Playwright
+        run: npm run test:e2e -- --reporter=list,html
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+  # Claude reviews the pull request's diff for security issues and fails the
+  # check on a high finding. PRs from forks get no secrets, so this job fails
+  # there for lack of a key.
+  ai-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Full history so the base branch is there to diff against; no token left
+      # in .git/config, since Claude can read every file in the checkout.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      # --bare loads no CLAUDE.md, skills, hooks, or plugins from the checkout,
+      # so the pull request under review cannot steer its own reviewer. The
+      # tools are read-only, for reading the code around a change.
+      - name: Security review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff "origin/$BASE_REF...HEAD" | claude -p --bare \
+            --tools Read,Grep,Glob --permission-mode dontAsk \
+            --max-turns 25 --max-budget-usd 2 \
+            --output-format json \
+            --json-schema "$(cat demos/a2-findings.schema.json)" \
+            "The input is the diff of a pull request against $BASE_REF. Review this diff for security issues only: authentication, authorization and per-user scoping, input validation, injection, and secrets in code, logs, or responses. Read the surrounding code to judge a change, but report only problems the diff introduces or touches, each with the file and a line in the new version. Severity: high when another user's data can be read or changed or a secret leaks; medium for a real defect with a limited blast radius; low for cheap hardening. Skip style. Return an empty list when there is nothing to report." \
+            > "$RUNNER_TEMP/review.json"
+          jq '{subtype, is_error, num_turns, total_cost_usd}' "$RUNNER_TEMP/review.json"
+          # A run cut off by --max-turns or --max-budget-usd has no findings.
+          jq -e '.is_error == false and .structured_output != null' "$RUNNER_TEMP/review.json" > /dev/null
+
+      - name: Write findings to the job summary
+        run: |
+          jq -r '
+            def cell: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+            .structured_output.findings
+            | sort_by({"high": 0, "medium": 1, "low": 2}[.severity])
+            | "## AI security review\n",
+              if length == 0 then "No findings."
+              else
+                "| Severity | Location | Finding | Fix |",
+                "|---|---|---|---|",
+                (.[] | "| \(.severity) | `\(.file):\(.line)` | \(.title | cell) | \(.fix | cell) |")
+              end
+          ' "$RUNNER_TEMP/review.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on high findings
+        run: |
+          high=$(jq '[.structured_output.findings[] | select(.severity == "high")] | length' "$RUNNER_TEMP/review.json")
+          if [ "$high" -gt 0 ]; then
+            echo "::error::The security review found $high high-severity finding(s); see the job summary."
+            exit 1
+          fi
